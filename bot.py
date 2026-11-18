@@ -3,25 +3,34 @@ from __future__ import annotations
 
 import hashlib
 import html
+import json
 import logging
 import os
 import re
 import sqlite3
 import time
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import Event, Thread
 from urllib.parse import urlparse, urljoin
 
 import feedparser
 import requests
-from deep_translator import GoogleTranslator
+from local_translation import translate_english
 from dotenv import load_dotenv
 
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHANNEL = os.getenv("TELEGRAM_CHANNEL_ID", "").strip()
-INTERVAL = max(60, int(os.getenv("POLL_INTERVAL_SECONDS", "600")))
+INTERVAL = max(5, int(os.getenv("POLL_INTERVAL_SECONDS", "15")))
+PH_INTERVAL = max(INTERVAL, int(os.getenv("PRODUCT_HUNT_POLL_SECONDS", "60")))
+PH_TOKEN = os.getenv("PRODUCT_HUNT_TOKEN", "").strip()
+PH_GRAPHQL = "https://api.producthunt.com/v2/api/graphql"
+HN_CACHE = OrderedDict()
+PH_FEED_CACHE = {}
+
 SKIP_EXISTING = os.getenv("SKIP_EXISTING_ON_FIRST_RUN", "true").lower() == "true"
 DB_PATH = os.getenv("DATABASE_PATH", "./data/startup_radar.sqlite3")
 MAX_POSTS = max(0, int(os.getenv("MAX_POSTS_PER_CYCLE", "15")))
@@ -38,17 +47,13 @@ def db_connect():
     con = sqlite3.connect(DB_PATH)
     con.execute("CREATE TABLE IF NOT EXISTS seen (id TEXT PRIMARY KEY, created_at TEXT NOT NULL)")
     con.execute("CREATE TABLE IF NOT EXISTS source_initialized (source TEXT PRIMARY KEY)")
+    con.execute("CREATE TABLE IF NOT EXISTS pending (id TEXT PRIMARY KEY, source TEXT NOT NULL, payload TEXT NOT NULL)")
     con.commit()
     return con
 
 
 def is_seen(con, item_id):
     return con.execute("SELECT 1 FROM seen WHERE id = ?", (item_id,)).fetchone() is not None
-
-
-def mark_seen(con, item_id):
-    con.execute("INSERT OR IGNORE INTO seen VALUES (?, ?)", (item_id, datetime.now(timezone.utc).isoformat()))
-    con.commit()
 
 
 def source_initialized(con, source):
@@ -58,7 +63,8 @@ def source_initialized(con, source):
 def initialize_source(con, source, items):
     if SKIP_EXISTING and not source_initialized(con, source):
         for item in items:
-            mark_seen(con, item["id"])
+            con.execute("INSERT OR IGNORE INTO seen VALUES (?, ?)",
+                        (item["id"], datetime.now(timezone.utc).isoformat()))
         log.info("Первый запуск: пропущено %s старых записей из %s", len(items), source)
     con.execute("INSERT OR IGNORE INTO source_initialized VALUES (?)", (source,))
     con.commit()
@@ -70,19 +76,27 @@ def clean(raw):
 
 
 def product_hunt():
-    resp = HTTP.get(PH_RSS, timeout=25)
+    headers = PH_FEED_CACHE.get("headers", {})
+    resp = HTTP.get(PH_RSS, headers=headers, timeout=10)
+    if resp.status_code == 304:
+        return PH_FEED_CACHE["items"]
     resp.raise_for_status()
     feed = feedparser.parse(resp.content)
-    if feed.bozo and not feed.entries:
-        raise RuntimeError(f"RSS error: {feed.bozo_exception}")
+    if not feed.entries and (feed.bozo or not feed.version):
+        raise RuntimeError("Product Hunt не вернул корректную RSS/Atom-ленту")
     items = []
     for entry in feed.entries:
         link = entry.get("link", "").strip()
         title = clean(entry.get("title", ""))
         if not title or not link:
             continue
-        description = clean(entry.get("summary", ""))[:700]
+        content = entry.get("content", [])
+        raw = content[0].get("value", "") if content else entry.get("summary", "")
+        # The Atom feed adds a separate paragraph with Discussion and Link.
+        description = clean(re.split(r"<p>\s*<a[^>]+>\s*Discussion", raw,
+                                     maxsplit=1, flags=re.I)[0])[:6000]
         stable_id = entry.get("id") or link
+        post_id = re.search(r":Post/(\d+)$", stable_id)
         # Product Hunt RSS sometimes contains media thumbnails / logos.
         photo = ""
         for media in entry.get("media_content", []) + entry.get("media_thumbnail", []):
@@ -104,7 +118,14 @@ def product_hunt():
         items.append({"id": "ph:" + hashlib.sha256(stable_id.encode()).hexdigest(),
                       "source": "Product Hunt", "title": title,
                       "description": description, "url": link, "photo": photo,
-                      "published": entry.get("published_parsed") or entry.get("updated_parsed")})
+                      "published": entry.get("published_parsed") or entry.get("updated_parsed"),
+                      "ph_id": post_id.group(1) if post_id else ""})
+    PH_FEED_CACHE["headers"] = {
+        condition: resp.headers[header]
+        for header, condition in (("ETag", "If-None-Match"), ("Last-Modified", "If-Modified-Since"))
+        if header in resp.headers
+    }
+    PH_FEED_CACHE["items"] = items
     return items
 
 
@@ -125,8 +146,10 @@ def hacker_news():
         response.raise_for_status()
         return story_id, response.json() or {}
 
-    with ThreadPoolExecutor(max_workers=12) as pool:
-        futures = [pool.submit(fetch, sid) for sid in unique_ids]
+    now = time.monotonic()
+    to_fetch = [sid for sid in unique_ids if HN_CACHE.get(sid, 0) <= now]
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        futures = [pool.submit(fetch, sid) for sid in to_fetch]
         for future in as_completed(futures):
             try:
                 story_id, story = future.result()
@@ -136,34 +159,79 @@ def hacker_news():
                 continue
             title = clean(story.get("title", ""))
             if story.get("deleted") or story.get("dead") or not title.lower().startswith("show hn:"):
+                if title:
+                    HN_CACHE[story_id] = now + 300
+                    HN_CACHE.move_to_end(story_id)
                 continue
             title = re.sub(r"^Show HN:\s*", "", title, flags=re.I)
             link = story.get("url") or f"https://news.ycombinator.com/item?id={story_id}"
             items.append({"id": f"hn:{story_id}", "source": "Hacker News / Show HN",
-                          "title": title, "description": clean(story.get("text", ""))[:700],
+                          "title": title, "description": clean(story.get("text", ""))[:6000],
+                          "author": story.get("by"), "kids": story.get("kids", [])[:8],
+                          "source_url": f"https://news.ycombinator.com/item?id={story_id}",
                           "url": link, "photo": "", "published": story.get("time", 0)})
-    if unique_ids and fetch_errors == len(unique_ids):
+    while len(HN_CACHE) > 1500:
+        HN_CACHE.popitem(last=False)
+    if to_fetch and fetch_errors == len(to_fetch):
         raise RuntimeError("Все запросы к Hacker News завершились ошибкой")
     items.sort(key=lambda it: it.get("published") or 0, reverse=True)
     log.info("HN: проверено %s записей, найдено %s Show HN, ошибок загрузки %s",
-             len(unique_ids), len(items), fetch_errors)
+             len(to_fetch), len(items), fetch_errors)
     return items
+
+
+def enrich(item):
+    item = item.copy()
+    if item.get("ph_id", "").isdigit() and PH_TOKEN:
+        response = HTTP.post(PH_GRAPHQL, timeout=10, headers={"Authorization": f"Bearer {PH_TOKEN}"},
+                             json={"query": "query($id: ID!) { post(id: $id) { name tagline description url website } }",
+                                   "variables": {"id": item["ph_id"]}})
+        response.raise_for_status()
+        data = response.json()
+        if data.get("errors"):
+            raise RuntimeError("Product Hunt GraphQL вернул ошибку")
+        post = (data.get("data") or {}).get("post")
+        if post:
+            item["title"] = clean(post.get("name")) or item["title"]
+            item["source_url"] = post.get("url") or item["url"]
+            item["url"] = post.get("website") or item["url"]
+            fields = [clean(post.get("tagline")), clean(post.get("description"))]
+            item["description"] = ("\n\n".join(dict.fromkeys(field for field in fields if field))
+                                   or item["description"])
+    elif item.get("author") and len(item["description"]) < 600:
+        for comment_id in item.get("kids", []):
+            try:
+                response = HTTP.get(f"{HN_API}/item/{comment_id}.json", timeout=2)
+                response.raise_for_status()
+                comment = response.json() or {}
+            except (requests.RequestException, ValueError):
+                continue
+            if comment.get("by") == item["author"] and not (comment.get("dead") or comment.get("deleted")):
+                extra = clean(comment.get("text"))
+                if extra and extra not in item["description"]:
+                    item["description"] = "\n\n".join(filter(None, (item["description"], extra)))
+                    break
+    return item
 
 
 def translate_to_russian(text):
     if not text:
         return ""
-    # Unofficial public Google Translate endpoint via deep-translator: availability may vary.
-    # Translation failures must not produce English posts in a Russian-language channel.
-    parts = [text[i:i + 3500] for i in range(0, min(len(text), 7000), 3500)]
-    translator = GoogleTranslator(source="auto", target="ru")
-    
-    try:
-        return " ".join(translator.translate(p) for p in parts)
-    except Exception as e:
-        print(f"Перевод недоступен: {type(e).__name__}. Используем оригинальный текст.")
+    if re.search(r"[А-Яа-яЁё]", text) and len(re.findall(r"[А-Яа-яЁё]", text)) > len(re.findall(r"[A-Za-z]", text)):
         return text
+    try:
+        result = translate_english(text)
+    except (OSError, RuntimeError, ValueError):
+        raise RuntimeError("Локальный перевод недоступен, публикация остаётся в очереди") from None
+    if not result or not re.search(r"[А-Яа-яЁё]", result):
+        raise RuntimeError("Переводчик не вернул русский текст")
+    return result
 
+
+def shorten(text, limit):
+    if len(text) <= limit:
+        return text
+    return text[:limit - 1].rsplit(" ", 1)[0] + "…"
 
 
 def category_for(item):
@@ -184,24 +252,30 @@ def category_for(item):
     return "🌍 Технологии и новые проекты"
 
 
-def format_post(item, photo_caption=False):
-    title_ru = translate_to_russian(item["title"])
-    desc_ru = translate_to_russian(item["description"]) if item["description"] else "Описание пока не опубликовано."
-    if not title_ru or not desc_ru:
-        raise RuntimeError("Пустой перевод")
-    # Telegram sendPhoto captions are limited to 1024 characters after parsing entities.
-    # Keep a comfortable margin; the text-only message can be slightly longer.
-    max_description = 480 if photo_caption else 1050
-    safe_title = html.escape(title_ru[:150])
-    safe_desc = html.escape(desc_ru[:max_description])
-    safe_url = html.escape(item["url"], quote=True)
-    safe_source = html.escape(item["source"])
-    safe_category = html.escape(category_for(item))
-    return (f"🚀 <b>{safe_title}</b>\n\n"
-            f"📝 {safe_desc}\n\n"
-            f"🏷 {safe_category}\n"
-            f"🌐 <a href=\"{safe_url}\">Сайт проекта</a>\n"
-            f"📡 Источник: {safe_source}\n\n"
+def web_url(url):
+    parsed = urlparse(url)
+    return url if parsed.scheme in ("http", "https") and parsed.hostname else ""
+
+
+def format_post(item):
+    # Keep the original product name. In Show HN the headline can be a full sentence.
+    title = item["title"]
+    if item["source"].startswith("Hacker News") and len(title.split()) > 3:
+        title = translate_to_russian(shorten(title, 350))
+    desc = shorten(item["description"], 3300)
+    translated = translate_to_russian(desc) if desc else "Источник пока не опубликовал описание."
+    within_budget = translated.encode("utf-16-le")[:5400].decode("utf-16-le", errors="ignore")
+    desc_ru = shorten(translated, len(within_budget))
+    project_url = web_url(item["url"])
+    source_url = web_url(item.get("source_url") or item["url"])
+    source = html.escape(item["source"])
+    source_link = f'<a href="{html.escape(source_url, quote=True)}">{source}</a>' if source_url else source
+    project_link = (f'🌐 <a href="{html.escape(project_url, quote=True)}">Сайт проекта</a>\n'
+                    if project_url and project_url != source_url else "")
+    return (f"🚀 <b>{html.escape(shorten(title, 180))}</b>\n\n"
+            f"📝 {html.escape(desc_ru)}\n\n"
+            f"🏷 {html.escape(category_for(item))}\n"
+            f"{project_link}📡 Источник: {source_link}\n\n"
             f"#стартапы #новыепроекты")
 
 
@@ -214,7 +288,7 @@ def _telegram_request(method, payload):
             if attempt < 3:
                 time.sleep(min(2 ** attempt * 2, 12))
                 continue
-            raise
+            raise RuntimeError("Telegram: сетевая ошибка") from None
         try:
             body = r.json()
         except ValueError:
@@ -226,7 +300,7 @@ def _telegram_request(method, payload):
             time.sleep(wait)
             continue
         if not r.ok or not body.get("ok"):
-            raise RuntimeError(f"Telegram: HTTP {r.status_code}: {body.get('description', r.text[:300])}")
+            raise RuntimeError(f"Telegram: HTTP {r.status_code}: {str(body.get('description', ''))[:300].replace(TOKEN, '[скрыто]')}")
         return
     raise RuntimeError("Telegram: не удалось отправить сообщение после повторов")
 
@@ -249,56 +323,70 @@ def image_for(item):
 
 
 def publish_item(item):
+    item = enrich(item)
+    text = format_post(item)
     photo = image_for(item)
-    if photo:
+    if photo and len(text.encode("utf-16-le")) <= 2000:
         try:
-            caption = format_post(item, photo_caption=True)
             _telegram_request("sendPhoto", {"chat_id": CHANNEL, "photo": photo,
-                                            "caption": caption, "parse_mode": "HTML"})
+                                            "caption": text, "parse_mode": "HTML"})
             return
-        except (RuntimeError, requests.RequestException) as exc:
+        except RuntimeError as exc:
             log.warning("Фото не отправлено (%s), пробую текстовую публикацию", exc)
-    send_telegram(format_post(item))
+    send_telegram(text)
 
 
-def run_cycle(con):
+def run_cycle(con, check_product_hunt=True):
     """Run one collection cycle; return counts for GitHub's log and exit code."""
     stats = {"found": 0, "new": 0, "published": 0,
              "sources_ok": 0, "source_errors": 0, "publication_errors": 0,
              "initialized": 0}
     for source, collector in (("producthunt", product_hunt), ("hackernews", hacker_news)):
-        try:
-            items = collector()
-        except Exception as exc:
-            stats["source_errors"] += 1
-            log.exception("Ошибка загрузки источника %s: %s", source, exc)
-            continue
-        stats["sources_ok"] += 1
-        stats["found"] += len(items)
-        if not items:
-            log.warning("Источник %s вернул 0 записей — не инициализирую историю", source)
-            continue
-        was_initialized = source_initialized(con, source)
-        if not was_initialized:
+        items = []
+        if source != "producthunt" or check_product_hunt:
+            try:
+                items = collector()
+                stats["sources_ok"] += 1
+                stats["found"] += len(items)
+            except Exception as exc:
+                stats["source_errors"] += 1
+                log.warning("Ошибка загрузки %s: %s", source, type(exc).__name__)
+        if items and not source_initialized(con, source):
             initialize_source(con, source, items)
             stats["initialized"] += 1
-        # Older first, keeping new posts in chronological order.
-        for item in reversed(items):
-            if is_seen(con, item["id"]):
-                continue
+        with con:
+            for item in reversed(items):
+                if not is_seen(con, item["id"]):
+                    con.execute("INSERT INTO pending VALUES (?, ?, ?) "
+                                "ON CONFLICT(id) DO UPDATE SET payload = excluded.payload",
+                                (item["id"], source, json.dumps(item, ensure_ascii=False)))
+        queued = con.execute("SELECT id, payload FROM pending WHERE source = ? ORDER BY rowid",
+                             (source,)).fetchall()
+        for item_id, payload in queued:
+            item = json.loads(payload)
             stats["new"] += 1
             if MAX_POSTS and stats["published"] >= MAX_POSTS:
-                log.info("Достигнут лимит публикаций за цикл: %s", MAX_POSTS)
                 break
             try:
-                publish_item(item)
-                mark_seen(con, item["id"])  # only after a confirmed Telegram send
-                stats["published"] += 1
-                log.info("ОПУБЛИКОВАНО: %s / %s", source, item["title"][:75])
-                time.sleep(1)
+                if not is_seen(con, item_id):
+                    publish_item(item)
+                    with con:
+                        con.execute("INSERT OR IGNORE INTO seen VALUES (?, ?)",
+                                    (item_id, datetime.now(timezone.utc).isoformat()))
+                        con.execute("DELETE FROM pending WHERE id = ?", (item_id,))
+                    if source == "hackernews":
+                        HN_CACHE[int(item_id.split(":", 1)[1])] = time.monotonic() + 300
+                    stats["published"] += 1
+                    log.info("ОПУБЛИКОВАНО: %s / %s", source, item["title"][:75])
+                    time.sleep(1)
+                else:
+                    with con:
+                        con.execute("DELETE FROM pending WHERE id = ?", (item_id,))
             except Exception as exc:
                 stats["publication_errors"] += 1
-                log.exception("Ошибка публикации %s: %s", item["id"], exc)
+                # Request exceptions can contain credentials or service URLs.
+                detail = str(exc) if type(exc) is RuntimeError else type(exc).__name__
+                log.warning("Ошибка публикации %s: %s", item_id, detail)
     log.info("ИТОГ: найдено=%s, новых=%s, опубликовано=%s, "
              "источников_успешно=%s, ошибок_источников=%s, ошибок_публикаций=%s, "
              "первичная_загрузка=%s", stats["found"], stats["new"], stats["published"],
@@ -307,14 +395,43 @@ def run_cycle(con):
     return stats
 
 
+def watch_hacker_news(wakeup):
+    """Wake the worker when Firebase updates the incoming story list."""
+    while True:
+        try:
+            with requests.get(f"{HN_API}/newstories.json", headers={"Accept": "text/event-stream"},
+                              stream=True, timeout=(5, 75)) as response:
+                response.raise_for_status()
+                if "text/event-stream" not in response.headers.get("Content-Type", ""):
+                    raise RuntimeError("Firebase не вернул поток событий")
+                for line in response.iter_lines(chunk_size=64):
+                    if line in (b"event: put", b"event: patch"):
+                        wakeup.set()
+                    elif line in (b"event: cancel", b"event: auth_revoked"):
+                        break
+        except (requests.RequestException, RuntimeError) as exc:
+            log.warning("Поток HN недоступен (%s), продолжаю опрос", type(exc).__name__)
+        time.sleep(10)
+
+
 def main():
     if not TOKEN or TOKEN == "PASTE_YOUR_BOT_TOKEN" or not CHANNEL or CHANNEL == "@your_channel_username":
         raise SystemExit("Заполните TELEGRAM_BOT_TOKEN и TELEGRAM_CHANNEL_ID в файле .env")
     with db_connect() as con:
         log.info("Бот запущен. Интервал: %s секунд. Канал: %s", INTERVAL, CHANNEL)
+        next_ph = 0.0
+        wakeup = Event()
+        Thread(target=watch_hacker_news, args=(wakeup,), daemon=True).start()
         while True:
-            run_cycle(con)
-            time.sleep(INTERVAL)
+            wakeup.clear()
+            start = time.monotonic()
+            check_ph = start >= next_ph
+            if check_ph:
+                next_ph = start + PH_INTERVAL
+            run_cycle(con, check_product_hunt=check_ph)
+            # Coalesce bursts, then wait for an event or the next regular check.
+            time.sleep(max(0, min(3, INTERVAL) - (time.monotonic() - start)))
+            wakeup.wait(max(0, INTERVAL - (time.monotonic() - start)))
 
 
 if __name__ == "__main__":
