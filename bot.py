@@ -157,7 +157,13 @@ def translate_to_russian(text):
     # Translation failures must not produce English posts in a Russian-language channel.
     parts = [text[i:i + 3500] for i in range(0, min(len(text), 7000), 3500)]
     translator = GoogleTranslator(source="auto", target="ru")
-    return " ".join(translator.translate(p) for p in parts)
+    
+    try:
+        return " ".join(translator.translate(p) for p in parts)
+    except Exception as e:
+        print(f"Перевод недоступен: {type(e).__name__}. Используем оригинальный текст.")
+        return text
+
 
 
 def category_for(item):
