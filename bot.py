@@ -18,7 +18,7 @@ from urllib.parse import urlparse, urljoin
 
 import feedparser
 import requests
-from bs4 import BeautifulSoup
+from local_translation import translate_english
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -26,7 +26,6 @@ TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHANNEL = os.getenv("TELEGRAM_CHANNEL_ID", "").strip()
 INTERVAL = max(5, int(os.getenv("POLL_INTERVAL_SECONDS", "15")))
 PH_INTERVAL = max(INTERVAL, int(os.getenv("PRODUCT_HUNT_POLL_SECONDS", "60")))
-TRANSLATE_KEY = os.getenv("GOOGLE_TRANSLATE_API_KEY", "").strip()
 PH_TOKEN = os.getenv("PRODUCT_HUNT_TOKEN", "").strip()
 PH_GRAPHQL = "https://api.producthunt.com/v2/api/graphql"
 HN_CACHE = OrderedDict()
@@ -221,20 +220,9 @@ def translate_to_russian(text):
     if re.search(r"[А-Яа-яЁё]", text) and len(re.findall(r"[А-Яа-яЁё]", text)) > len(re.findall(r"[A-Za-z]", text)):
         return text
     try:
-        if TRANSLATE_KEY:
-            response = HTTP.post("https://translation.googleapis.com/language/translate/v2",
-                                 headers={"X-Goog-Api-Key": TRANSLATE_KEY},
-                                 json={"q": text, "target": "ru", "format": "text"}, timeout=8)
-            response.raise_for_status()
-            result = response.json()["data"]["translations"][0]["translatedText"]
-        else:
-            response = HTTP.get("https://translate.google.com/m",
-                                params={"sl": "auto", "tl": "ru", "q": text}, timeout=8)
-            response.raise_for_status()
-            node = BeautifulSoup(response.text, "html.parser").select_one(".result-container, .t0")
-            result = node.get_text(" ", strip=True) if node else ""
-    except (requests.RequestException, ValueError, KeyError, IndexError):
-        raise RuntimeError("Перевод недоступен, публикация остаётся в очереди") from None
+        result = translate_english(text)
+    except (OSError, RuntimeError, ValueError):
+        raise RuntimeError("Локальный перевод недоступен, публикация остаётся в очереди") from None
     if not result or not re.search(r"[А-Яа-яЁё]", result):
         raise RuntimeError("Переводчик не вернул русский текст")
     return result
