@@ -2,10 +2,14 @@ name: Startup Radar publisher
 
 on:
   schedule:
-    # UTC; approximate 10-minute cadence (GitHub may delay or skip scheduled runs)
-    - cron: '8,18,28,38,48,58 * * * *'
+    # UTC; approximate 5-minute cadence (GitHub may delay or skip scheduled runs)
+    - cron: '3-58/5 * * * *'
   workflow_dispatch:
     inputs:
+      check_translation:
+        description: "Check Russian translation without sending to Telegram"
+        type: boolean
+        default: false
       test_message:
         description: 'Send a test Telegram message'
         required: false
@@ -33,11 +37,19 @@ jobs:
           cache: 'pip'
       - name: Install dependencies
         run: pip install -r requirements.txt
+      - name: Check Russian translation
+        if: ${{ inputs.check_translation }}
+        env:
+          GOOGLE_TRANSLATE_API_KEY: ${{ secrets.GOOGLE_TRANSLATE_API_KEY }}
+        run: python -c 'from bot import translate_to_russian; print(translate_to_russian("A tool that organizes customer feedback and routes requests to specialists."))'
       - name: Collect projects or send test
+        if: ${{ !inputs.check_translation }}
         id: collect
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
+          GOOGLE_TRANSLATE_API_KEY: ${{ secrets.GOOGLE_TRANSLATE_API_KEY }}
+          PRODUCT_HUNT_TOKEN: ${{ secrets.PRODUCT_HUNT_TOKEN }}
           DATABASE_PATH: ./data/startup_radar.sqlite3
           SKIP_EXISTING_ON_FIRST_RUN: 'true'
           MAX_POSTS_PER_CYCLE: '15'
