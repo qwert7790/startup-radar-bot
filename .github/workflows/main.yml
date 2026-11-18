@@ -3,7 +3,7 @@ name: Startup Radar publisher
 
 on:
   schedule:
-    - cron: '7,17,27,37,47,57 * * * *'
+   - cron: '8,18,28,38,48,58 * * * *'
   workflow_dispatch:
     inputs:
       test_message:
