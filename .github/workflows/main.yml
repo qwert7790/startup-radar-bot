@@ -20,7 +20,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: startup-radar-publisher
+  group: startup-radar-publisher-${{ github.ref_name }}
   cancel-in-progress: false
 
 jobs:
@@ -37,10 +37,15 @@ jobs:
           cache: 'pip'
       - name: Install dependencies
         run: pip install -r requirements.txt
+      - name: Cache Argos English-to-Russian model
+        uses: actions/cache@v4
+        with:
+          path: .models
+          key: startup-radar-argos-en-ru-1.9
+      - name: Prepare offline translator
+        run: python local_translation.py
       - name: Check Russian translation
         if: ${{ inputs.check_translation || github.ref_name != github.event.repository.default_branch }}
-        env:
-          GOOGLE_TRANSLATE_API_KEY: ${{ secrets.GOOGLE_TRANSLATE_API_KEY }}
         run: python -c 'from bot import translate_to_russian; print(translate_to_russian("A tool that organizes customer feedback and routes requests to specialists."))'
       - name: Collect projects or send test
         if: ${{ !inputs.check_translation && github.ref_name == github.event.repository.default_branch }}
@@ -48,7 +53,6 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
-          GOOGLE_TRANSLATE_API_KEY: ${{ secrets.GOOGLE_TRANSLATE_API_KEY }}
           PRODUCT_HUNT_TOKEN: ${{ secrets.PRODUCT_HUNT_TOKEN }}
           DATABASE_PATH: ./data/startup_radar.sqlite3
           SKIP_EXISTING_ON_FIRST_RUN: 'true'
