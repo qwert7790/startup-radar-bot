@@ -8,9 +8,10 @@ import os
 import re
 import sqlite3
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 
 import feedparser
 import requests
@@ -82,35 +83,70 @@ def product_hunt():
             continue
         description = clean(entry.get("summary", ""))[:700]
         stable_id = entry.get("id") or link
+        # Product Hunt RSS sometimes contains media thumbnails / logos.
+        photo = ""
+        for media in entry.get("media_content", []) + entry.get("media_thumbnail", []):
+            candidate = media.get("url", "")
+            if candidate.startswith("https://"):
+                photo = candidate
+                break
+        if not photo:
+            for enclosure in entry.get("enclosures", []):
+                if enclosure.get("type", "").startswith("image/") and enclosure.get("href", "").startswith("https://"):
+                    photo = enclosure["href"]
+                    break
+        if not photo:
+            match = re.search(r'<img[^>]+src=["\']([^"\']+)', entry.get("summary", ""), flags=re.I)
+            if match:
+                candidate = urljoin(link, html.unescape(match.group(1)))
+                if candidate.startswith("https://"):
+                    photo = candidate
         items.append({"id": "ph:" + hashlib.sha256(stable_id.encode()).hexdigest(),
                       "source": "Product Hunt", "title": title,
-                      "description": description, "url": link,
+                      "description": description, "url": link, "photo": photo,
                       "published": entry.get("published_parsed") or entry.get("updated_parsed")})
     return items
 
 
 def hacker_news():
-    # Show HN is a showcase feed, not a verified register of incorporated startups.
-    resp = HTTP.get(f"{HN_API}/showstories.json", timeout=25)
-    resp.raise_for_status()
-    story_ids = resp.json()[:75]
+    """Search both fresh HN submissions and the curated Show HN list."""
+    story_ids = []
+    for endpoint, limit in (("newstories", 180), ("showstories", 75)):
+        response = HTTP.get(f"{HN_API}/{endpoint}.json", timeout=25)
+        response.raise_for_status()
+        story_ids.extend(response.json()[:limit])
+    unique_ids = list(dict.fromkeys(story_ids))
     items = []
-    for story_id in story_ids:
-        try:
-            r = HTTP.get(f"{HN_API}/item/{story_id}.json", timeout=12)
-            r.raise_for_status()
-            story = r.json() or {}
+    fetch_errors = 0
+
+    def fetch(story_id):
+        # Thread-local request per call; do not share a mutable Session across workers.
+        response = requests.get(f"{HN_API}/item/{story_id}.json", timeout=14)
+        response.raise_for_status()
+        return story_id, response.json() or {}
+
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        futures = [pool.submit(fetch, sid) for sid in unique_ids]
+        for future in as_completed(futures):
+            try:
+                story_id, story = future.result()
+            except (requests.RequestException, ValueError) as exc:
+                fetch_errors += 1
+                log.warning("Не удалось получить HN item: %s", exc)
+                continue
             title = clean(story.get("title", ""))
             if story.get("deleted") or story.get("dead") or not title.lower().startswith("show hn:"):
                 continue
             title = re.sub(r"^Show HN:\s*", "", title, flags=re.I)
             link = story.get("url") or f"https://news.ycombinator.com/item?id={story_id}"
-            description = clean(story.get("text", ""))[:700]
             items.append({"id": f"hn:{story_id}", "source": "Hacker News / Show HN",
-                          "title": title, "description": description,
-                          "url": link, "published": story.get("time", 0)})
-        except (requests.RequestException, ValueError) as exc:
-            log.warning("Не удалось получить HN item %s: %s", story_id, exc)
+                          "title": title, "description": clean(story.get("text", ""))[:700],
+                          "url": link, "photo": "", "published": story.get("time", 0)})
+    if unique_ids and fetch_errors == len(unique_ids):
+        raise RuntimeError("Все запросы к Hacker News завершились ошибкой")
+    items.sort(key=lambda it: it.get("published") or 0, reverse=True)
+    log.info("HN: проверено %s записей, найдено %s Show HN, ошибок загрузки %s",
+             len(unique_ids), len(items), fetch_errors)
     return items
 
 
@@ -124,74 +160,145 @@ def translate_to_russian(text):
     return " ".join(translator.translate(p) for p in parts)
 
 
-def format_post(item):
+def category_for(item):
+    text = (item.get("title", "") + " " + item.get("description", "")).lower()
+    groups = [
+        ("🤖 Искусственный интеллект", ("ai ", " ai", "artificial intelligence", "llm", "gpt", "machine learning")),
+        ("💰 Финтех", ("fintech", "payments", "banking", "finance", "crypto")),
+        ("🧰 Для бизнеса / SaaS", ("saas", "crm", "automation", "business", "workflow")),
+        ("📱 Приложения", ("ios", "android", "mobile", "app ")),
+        ("🎮 Игры", ("game", "gaming")),
+        ("🏥 Здоровье", ("health", "medical", "fitness")),
+        ("🛍 Электронная коммерция", ("shop", "ecommerce", "e-commerce", "marketplace")),
+        ("🧑‍💻 Инструменты разработчиков", ("developer", "api", "github", "coding", "open source")),
+    ]
+    for label, words in groups:
+        if any(word in text for word in words):
+            return label
+    return "🌍 Технологии и новые проекты"
+
+
+def format_post(item, photo_caption=False):
     title_ru = translate_to_russian(item["title"])
     desc_ru = translate_to_russian(item["description"]) if item["description"] else "Описание пока не опубликовано."
     if not title_ru or not desc_ru:
         raise RuntimeError("Пустой перевод")
-    # Avoid embedding untrusted HTML in Telegram HTML mode.
-    safe_title = html.escape(title_ru[:230])
-    safe_desc = html.escape(desc_ru[:1200])
+    # Telegram sendPhoto captions are limited to 1024 characters after parsing entities.
+    # Keep a comfortable margin; the text-only message can be slightly longer.
+    max_description = 480 if photo_caption else 1050
+    safe_title = html.escape(title_ru[:150])
+    safe_desc = html.escape(desc_ru[:max_description])
     safe_url = html.escape(item["url"], quote=True)
     safe_source = html.escape(item["source"])
-    return (f"🚀 <b>НОВЫЙ ПРОЕКТ: {safe_title}</b>\n\n"
+    safe_category = html.escape(category_for(item))
+    return (f"🚀 <b>{safe_title}</b>\n\n"
             f"📝 {safe_desc}\n\n"
-            f"🌐 <a href=\"{safe_url}\">Открыть проект</a>\n"
+            f"🏷 {safe_category}\n"
+            f"🌐 <a href=\"{safe_url}\">Сайт проекта</a>\n"
             f"📡 Источник: {safe_source}\n\n"
             f"#стартапы #новыепроекты")
 
 
-def send_telegram(text):
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+def _telegram_request(method, payload):
+    url = f"https://api.telegram.org/bot{TOKEN}/{method}"
     for attempt in range(4):
-        r = HTTP.post(url, json={"chat_id": CHANNEL, "text": text,
-                                  "parse_mode": "HTML", "disable_web_page_preview": True}, timeout=30)
+        try:
+            r = HTTP.post(url, json=payload, timeout=30)
+        except requests.RequestException:
+            if attempt < 3:
+                time.sleep(min(2 ** attempt * 2, 12))
+                continue
+            raise
         try:
             body = r.json()
         except ValueError:
             body = {}
-        if r.status_code == 429 and attempt < 3:
-            wait = min(90, max(1, int(body.get("parameters", {}).get("retry_after", 5))))
-            log.warning("Telegram rate limit, ожидание %ss", wait)
+        if (r.status_code == 429 or r.status_code >= 500) and attempt < 3:
+            wait = (max(1, int(body.get("parameters", {}).get("retry_after", 5)))
+                    if r.status_code == 429 else min(2 ** attempt * 2, 12))
+            log.warning("Telegram HTTP %s: повтор через %s секунд", r.status_code, wait)
             time.sleep(wait)
             continue
         if not r.ok or not body.get("ok"):
             raise RuntimeError(f"Telegram: HTTP {r.status_code}: {body.get('description', r.text[:300])}")
         return
-    raise RuntimeError("Telegram rate limit")
+    raise RuntimeError("Telegram: не удалось отправить сообщение после повторов")
+
+
+def send_telegram(text):
+    _telegram_request("sendMessage", {"chat_id": CHANNEL, "text": text,
+                                     "parse_mode": "HTML", "disable_web_page_preview": True})
+
+
+def image_for(item):
+    # Prefer an actual product image exposed by the RSS feed.
+    photo = item.get("photo", "")
+    if photo.startswith("https://"):
+        return photo
+    # Otherwise use a site favicon: this is an icon, not necessarily the official startup logo.
+    host = urlparse(item["url"]).hostname or ""
+    if host and host not in ("news.ycombinator.com", "www.producthunt.com", "producthunt.com"):
+        return f"https://www.google.com/s2/favicons?domain={host}&sz=128"
+    return ""
+
+
+def publish_item(item):
+    photo = image_for(item)
+    if photo:
+        try:
+            caption = format_post(item, photo_caption=True)
+            _telegram_request("sendPhoto", {"chat_id": CHANNEL, "photo": photo,
+                                            "caption": caption, "parse_mode": "HTML"})
+            return
+        except (RuntimeError, requests.RequestException) as exc:
+            log.warning("Фото не отправлено (%s), пробую текстовую публикацию", exc)
+    send_telegram(format_post(item))
 
 
 def run_cycle(con):
-    total = 0
+    """Run one collection cycle; return counts for GitHub's log and exit code."""
+    stats = {"found": 0, "new": 0, "published": 0,
+             "sources_ok": 0, "source_errors": 0, "publication_errors": 0,
+             "initialized": 0}
     for source, collector in (("producthunt", product_hunt), ("hackernews", hacker_news)):
         try:
             items = collector()
-            # Do not initialize when an empty response could be a transient issue.
-            if not items:
-                log.warning("Источник %s вернул 0 записей", source)
-                continue
-            if not source_initialized(con, source):
-                initialize_source(con, source, items)
-            # HN items are newest-first; use reverse order to post older items first.
-            for item in reversed(items):
-                if is_seen(con, item["id"]):
-                    continue
-                if MAX_POSTS and total >= MAX_POSTS:
-                    log.info("Достигнут лимит публикаций за цикл: %s", MAX_POSTS)
-                    return
-                try:
-                    message = format_post(item)
-                    send_telegram(message)
-                    mark_seen(con, item["id"])  # only after successful Telegram send
-                    total += 1
-                    log.info("Опубликовано: %s / %s", source, item["title"][:75])
-                    time.sleep(2)  # reduce flood risk
-                except Exception as exc:
-                    log.exception("Ошибка публикации %s: %s", item["id"], exc)
-                    # Do not mark seen: retry next cycle.
         except Exception as exc:
-            log.exception("Ошибка источника %s: %s", source, exc)
-    log.info("Цикл завершён. Опубликовано: %s", total)
+            stats["source_errors"] += 1
+            log.exception("Ошибка загрузки источника %s: %s", source, exc)
+            continue
+        stats["sources_ok"] += 1
+        stats["found"] += len(items)
+        if not items:
+            log.warning("Источник %s вернул 0 записей — не инициализирую историю", source)
+            continue
+        was_initialized = source_initialized(con, source)
+        if not was_initialized:
+            initialize_source(con, source, items)
+            stats["initialized"] += 1
+        # Older first, keeping new posts in chronological order.
+        for item in reversed(items):
+            if is_seen(con, item["id"]):
+                continue
+            stats["new"] += 1
+            if MAX_POSTS and stats["published"] >= MAX_POSTS:
+                log.info("Достигнут лимит публикаций за цикл: %s", MAX_POSTS)
+                break
+            try:
+                publish_item(item)
+                mark_seen(con, item["id"])  # only after a confirmed Telegram send
+                stats["published"] += 1
+                log.info("ОПУБЛИКОВАНО: %s / %s", source, item["title"][:75])
+                time.sleep(1)
+            except Exception as exc:
+                stats["publication_errors"] += 1
+                log.exception("Ошибка публикации %s: %s", item["id"], exc)
+    log.info("ИТОГ: найдено=%s, новых=%s, опубликовано=%s, "
+             "источников_успешно=%s, ошибок_источников=%s, ошибок_публикаций=%s, "
+             "первичная_загрузка=%s", stats["found"], stats["new"], stats["published"],
+             stats["sources_ok"], stats["source_errors"], stats["publication_errors"],
+             stats["initialized"])
+    return stats
 
 
 def main():
